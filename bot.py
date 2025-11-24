@@ -1,17 +1,21 @@
 import asyncio
+import os
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, WebAppInfo
 
-# === ТВОЙ ТОКЕН ПРЯМО ТУТ ===
-BOT_TOKEN = "8221702811:AAFZDdlxEFt486b5n-HSEZKMTpH5IiftqDE"
+# === ТОКЕН БУДЕМ БРАТЬ ИЗ ПЕРЕМЕННОЙ ОКРУЖЕНИЯ ===
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-# === ПОСТОЯННАЯ ССЫЛКА НА ФРОНТ ===
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN не задан! Укажи его в переменных окружения Render.")
+
+# === ССЫЛКА НА ФРОНТ (Vercel) ===
 FRONT_URL = "https://luchwallet-frontend.vercel.app/?v=2"
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-# === КНОПКА WEBAPP ===
+# === КЛАВИАТУРА С WEBAPP-КНОПКОЙ ===
 wallet_keyboard = InlineKeyboardMarkup(
     inline_keyboard=[
         [
@@ -23,7 +27,7 @@ wallet_keyboard = InlineKeyboardMarkup(
     ]
 )
 
-# === START ===
+
 @dp.message(F.text == "/start")
 async def start(message: types.Message):
     await message.answer(
@@ -31,7 +35,7 @@ async def start(message: types.Message):
         reply_markup=wallet_keyboard
     )
 
-# === ЛЮБОЕ ДРУГОЕ СООБЩЕНИЕ ===
+
 @dp.message()
 async def any_message(message: types.Message):
     await message.answer(
@@ -39,9 +43,11 @@ async def any_message(message: types.Message):
         reply_markup=wallet_keyboard
     )
 
+
 async def main():
-    print("Bot is running...")
+    print("Bot is running on Render...")
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

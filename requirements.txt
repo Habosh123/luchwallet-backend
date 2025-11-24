@@ -7,3 +7,4 @@ passlib[argon2]
 argon2-cffi
 jinja2
 python-multipart
+aiogram==3.13.1
