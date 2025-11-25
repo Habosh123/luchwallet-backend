@@ -1,10 +1,12 @@
 from datetime import datetime
 import json
+import os
 from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, Field
 
 from sqlalchemy import (
     create_engine,
@@ -14,6 +16,7 @@ from sqlalchemy import (
     Text,
     DateTime,
     Boolean,
+    text,
 )
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 
@@ -26,6 +29,10 @@ from passlib.context import CryptContext
 
 # Локальная SQLite
 DATABASE_URL = "sqlite:///./luchwallet.db"
+
+# Папка для фото сотрудников
+PHOTOS_DIR = "photos"
+os.makedirs(PHOTOS_DIR, exist_ok=True)
 
 # Для PostgreSQL потом будет так:
 # DATABASE_URL = "postgresql+psycopg2://user:password@host:5432/dbname"
@@ -68,6 +75,8 @@ class Employee(Base):
     id = Column(Integer, primary_key=True, index=True)
     login = Column(String(50), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
+    # Открытый пароль — ТОЛЬКО для админ-панели (по ТЗ)
+    password_plain = Column(String(255), nullable=True)
 
     initials = Column(String(8), nullable=False)
     name = Column(String(255), nullable=False)
@@ -167,8 +176,12 @@ class EmployeeShort(BaseModel):
     is_active: bool
     photo_url: Optional[str] = None
 
+    # пароль, который увидит админ
+    password: Optional[str] = Field(None, alias="password_plain")
+
     class Config:
         orm_mode = True
+        allow_population_by_field_name = True
 
 
 class EmployeeDetail(EmployeeBase):
@@ -176,8 +189,12 @@ class EmployeeDetail(EmployeeBase):
     login: str
     is_active: bool
 
+    # текущий пароль (для карточки сотрудника в админке)
+    password: Optional[str] = Field(None, alias="password_plain")
+
     class Config:
         orm_mode = True
+        allow_population_by_field_name = True
 
 
 # ===============================
@@ -202,11 +219,20 @@ def init_db():
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
+        # пробуем добавить колонку password_plain, если её ещё нет
+        try:
+            db.execute(text("ALTER TABLE employees ADD COLUMN password_plain VARCHAR(255);"))
+            db.commit()
+        except Exception:
+            db.rollback()
+            # колонка уже есть или БД только что создана — игнорируем
+
         # демо-сотрудник ivan
         if not db.query(Employee).filter_by(login="ivan").first():
             emp = Employee(
                 login="ivan",
                 password_hash=get_password_hash("1234"),
+                password_plain="1234",
                 initials="ИИ",
                 name="Иванов Иван Иванович",
                 position="Водитель грузового автомобиля · Колонна № 3",
@@ -236,6 +262,7 @@ def init_db():
             emp = Employee(
                 login="anna",
                 password_hash=get_password_hash("qwerty"),
+                password_plain="qwerty",
                 initials="АП",
                 name="Антонова Анна Петровна",
                 position="Диспетчер смен · Офис № 2",
@@ -299,6 +326,9 @@ def require_admin(
 # ===============================
 
 app = FastAPI(title="LuchWallet API", version="2.0.0")
+
+# статика для фото сотрудников
+app.mount("/static", StaticFiles(directory=PHOTOS_DIR), name="static")
 
 app.add_middleware(
     CORSMiddleware,
@@ -401,6 +431,7 @@ def get_employee(
         error_text=emp.error_text,
         photo_url=emp.photo_url,
         is_active=emp.is_active,
+        password=emp.password_plain,
     )
 
 
@@ -418,6 +449,7 @@ def create_employee(
     emp = Employee(
         login=payload.login.lower(),
         password_hash=get_password_hash(payload.password),
+        password_plain=payload.password,
         initials=payload.initials,
         name=payload.name,
         position=payload.position,
@@ -467,6 +499,7 @@ def update_employee(
     new_password = data.pop("password", None)
     if new_password:
         emp.password_hash = get_password_hash(new_password)
+        emp.password_plain = new_password
 
     # остальные поля
     if "initials" in data:
@@ -517,3 +550,30 @@ def delete_employee(
     db.delete(emp)
     db.commit()
     return {"status": "deleted", "id": emp_id}
+
+
+# ---------- АДМИН: ЗАГРУЗКА ФОТО СОТРУДНИКА ----------
+
+@app.post("/api/employees/{emp_id}/photo")
+def upload_employee_photo(
+    emp_id: int,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    admin: Admin = Depends(require_admin),
+):
+    emp = db.query(Employee).filter(Employee.id == emp_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
+
+    ext = os.path.splitext(file.filename)[1] or ".jpg"
+    filename = f"employee_{emp_id}{ext}"
+    filepath = os.path.join(PHOTOS_DIR, filename)
+
+    with open(filepath, "wb") as f:
+        f.write(file.file.read())
+
+    emp.photo_url = f"/static/{filename}"
+    db.commit()
+    db.refresh(emp)
+
+    return {"status": "ok", "photo_url": emp.photo_url}
