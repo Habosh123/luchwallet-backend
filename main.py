@@ -1,8 +1,10 @@
-from datetime import datetime
+from datetime import datetime, timedelta
+import io
+from fastapi.responses import StreamingResponse
+from openpyxl import Workbook
 import json
 import os
 from typing import List, Optional
-
 from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -27,10 +29,8 @@ from passlib.context import CryptContext
 #   НАСТРОЙКА БАЗЫ ДАННЫХ
 # ===============================
 
-# Локальная SQLite
 DATABASE_URL = "sqlite:///./luchwallet.db"
 
-# Папка для фото сотрудников
 PHOTOS_DIR = "photos"
 os.makedirs(PHOTOS_DIR, exist_ok=True)
 
@@ -42,7 +42,6 @@ engine = create_engine(
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
-# Используем argon2
 pwd_context = CryptContext(schemes=["argon2"], deprecated="auto")
 
 
@@ -66,33 +65,45 @@ def get_db():
 #            МОДЕЛИ БД
 # ===============================
 
+
 class Employee(Base):
     __tablename__ = "employees"
 
     id = Column(Integer, primary_key=True, index=True)
     login = Column(String(50), unique=True, index=True, nullable=False)
     password_hash = Column(String(255), nullable=False)
-    # Открытый пароль — ТОЛЬКО для админ-панели (по ТЗ)
+    # открытый пароль только для админ-панели по ТЗ
     password_plain = Column(String(255), nullable=True)
 
     initials = Column(String(8), nullable=False)
     name = Column(String(255), nullable=False)
     position = Column(String(255), nullable=False)
 
-    rate = Column(String(50), nullable=True)         # "1 850 ₽/смена"
-    experience = Column(String(50), nullable=True)   # "4 года 7 мес."
-    status = Column(String(100), nullable=True)      # "Активен · Основное место"
+    # Оклад
+    rate = Column(String(50), nullable=True)
+    experience = Column(String(50), nullable=True)
+    status = Column(String(100), nullable=True)
 
-    salary = Column(String(50), nullable=True)       # "92 430 ₽"
-    hours = Column(String(50), nullable=True)        # "152 ч"
+    # Отображаемые поля
+    salary = Column(String(50), nullable=True)   # отображаемый баланс
+    hours = Column(String(50), nullable=True)    # отображаемые часы за месяц
     hours_detail = Column(String(255), nullable=True)
 
-    penalties_json = Column(Text, nullable=True)     # JSON-список строк
-    absences_json = Column(Text, nullable=True)      # JSON-список строк
+    penalties_json = Column(Text, nullable=True)
+    absences_json = Column(Text, nullable=True)
 
     error_text = Column(String(255), nullable=True)
 
-    photo_url = Column(String(512), nullable=True)   # ссылка на фото (аватар)
+    photo_url = Column(String(512), nullable=True)
+
+    # === динамический баланс ===
+    balance_int = Column(Integer, nullable=True)               # фактический баланс в рублях
+    contract_hours_per_month = Column(Integer, nullable=True)  # нормочасы в месяц
+    hourly_rate = Column(Integer, nullable=True)               # ₽/час
+    schedule_type = Column(String(50), nullable=True)          # office / None / ...
+    work_start_hour = Column(Integer, nullable=True)           # 0–23
+    work_end_hour = Column(Integer, nullable=True)             # 0–23 (не включая)
+    last_balance_update = Column(DateTime, nullable=True)
 
     is_active = Column(Boolean, default=True)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -112,8 +123,8 @@ class Payment(Base):
     """
     История начислений/удержаний сотрудника.
     amount в рублях:
-      >0 — начисление (зарплата, премия, переработка)
-      <0 — удержание (штраф, вычет)
+      >0 — начисление
+      <0 — удержание
     """
     __tablename__ = "payments"
 
@@ -122,6 +133,29 @@ class Payment(Base):
     type = Column(String(50), nullable=False)  # salary / bonus / overtime / night / fine / other
     amount = Column(Integer, nullable=False)
     comment = Column(String(255), nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow, index=True)
+
+
+class EmployeeMonthStat(Base):
+    """
+    Помесячная статистика дохода/часов/штрафов.
+    Хранится отдельно от основной карточки сотрудника.
+    """
+    __tablename__ = "employee_month_stats"
+
+    id = Column(Integer, primary_key=True, index=True)
+    employee_id = Column(Integer, index=True, nullable=False)
+    year = Column(Integer, nullable=False)
+    month = Column(Integer, nullable=False)  # 1-12
+    month_key = Column(String(8), nullable=False)  # jan, feb, ...
+
+    income = Column(Integer, nullable=False, default=0)  # общий доход за месяц
+    salary = Column(Integer, nullable=True)              # начисленная зарплата
+    hours = Column(Integer, nullable=True)               # отработанные часы
+
+    penalties_json = Column(Text, nullable=True)         # JSON-список строк
+    absences_json = Column(Text, nullable=True)          # JSON-список строк
+
     created_at = Column(DateTime, default=datetime.utcnow, index=True)
 
 
@@ -163,7 +197,6 @@ class EmployeeCreate(EmployeeBase):
 
 
 class EmployeeUpdate(BaseModel):
-    # все поля опциональные, можно менять только то, что нужно
     initials: Optional[str] = None
     name: Optional[str] = None
     position: Optional[str] = None
@@ -177,7 +210,7 @@ class EmployeeUpdate(BaseModel):
     absences: Optional[List[str]] = None
     error_text: Optional[str] = None
     photo_url: Optional[str] = None
-    # смена логина/пароля при необходимости
+    # смена логина/пароля
     login: Optional[str] = None
     password: Optional[str] = None
 
@@ -190,7 +223,6 @@ class EmployeeShort(BaseModel):
     is_active: bool
     photo_url: Optional[str] = None
 
-    # пароль, который увидит админ
     password: Optional[str] = Field(None, alias="password_plain")
 
     class Config:
@@ -202,8 +234,6 @@ class EmployeeDetail(EmployeeBase):
     id: int
     login: str
     is_active: bool
-
-    # текущий пароль (для карточки сотрудника в админке)
     password: Optional[str] = Field(None, alias="password_plain")
 
     class Config:
@@ -212,8 +242,8 @@ class EmployeeDetail(EmployeeBase):
 
 
 class PaymentBaseSchema(BaseModel):
-    type: str          # salary / bonus / overtime / night / fine / other
-    amount: int        # в рублях, >0 или <0
+    type: str
+    amount: int
     comment: Optional[str] = None
 
 
@@ -231,7 +261,7 @@ class PaymentOut(PaymentBaseSchema):
 
 
 # ===============================
-#        ИНИЦИАЛИЗАЦИЯ БД
+#        ВСПОМОГАТЕЛЬНОЕ
 # ===============================
 
 def json_dumps_list(values: List[str]) -> str:
@@ -247,18 +277,190 @@ def json_loads_list(raw: Optional[str]) -> List[str]:
         return []
 
 
+def money_to_int(value: Optional[str]) -> int:
+    """'92 430 ₽' -> 92430"""
+    if not value:
+        return 0
+    digits = "".join(ch for ch in str(value) if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+def int_to_money(value: int) -> str:
+    """92430 -> '92 430 ₽'"""
+    s = f"{value:,}".replace(",", " ")
+    return f"{s} ₽"
+
+
+def is_office_work_time(dt: datetime, start_hour: int, end_hour: int) -> bool:
+    """
+    Простейшая модель: офисники работают Пн–Пт с start_hour до end_hour (без учёта обеда).
+    """
+    if dt.weekday() >= 5:  # 5,6 = сб, вс
+        return False
+    h = dt.hour
+    if start_hour <= end_hour:
+        return start_hour <= h < end_hour
+    # если смена «через ночь»
+    return h >= start_hour or h < end_hour
+
+
+def accrue_balance_for_employee(emp: Employee, now: Optional[datetime] = None):
+    """
+    Обновляет баланс сотрудника в БД по почасовой ставке.
+    Для простоты:
+      - автоматом считаем только для schedule_type == 'office'
+      - берём каждый полный час между last_balance_update и now,
+        если час попадает в рабочее время – начисляем hourly_rate.
+    """
+    if emp.schedule_type != "office":
+        return
+    if not emp.hourly_rate:
+        return
+
+    if now is None:
+        now = datetime.utcnow()
+
+    # инициализация
+    if not emp.last_balance_update:
+        emp.last_balance_update = now
+        if emp.balance_int is None:
+            emp.balance_int = money_to_int(emp.salary or "0")
+        return
+
+    cursor = emp.last_balance_update.replace(minute=0, second=0, microsecond=0)
+    if cursor >= now:
+        return
+
+    hours_to_pay = 0
+    while cursor + timedelta(hours=1) <= now:
+        if is_office_work_time(cursor, emp.work_start_hour or 8, emp.work_end_hour or 19):
+            hours_to_pay += 1
+        cursor += timedelta(hours=1)
+
+    if hours_to_pay > 0:
+        current_balance = emp.balance_int or money_to_int(emp.salary or "0")
+        current_balance += hours_to_pay * emp.hourly_rate
+        emp.balance_int = current_balance
+        emp.salary = int_to_money(current_balance)
+
+    emp.last_balance_update = cursor
+
+
+MONTH_META = {
+    1: {"key": "jan", "short": "Янв", "full": "Январь"},
+    2: {"key": "feb", "short": "Фев", "full": "Февраль"},
+    3: {"key": "mar", "short": "Мар", "full": "Март"},
+    4: {"key": "apr", "short": "Апр", "full": "Апрель"},
+    5: {"key": "may", "short": "Май", "full": "Май"},
+    6: {"key": "jun", "short": "Июн", "full": "Июнь"},
+    7: {"key": "jul", "short": "Июл", "full": "Июль"},
+    8: {"key": "aug", "short": "Авг", "full": "Август"},
+    9: {"key": "sep", "short": "Сен", "full": "Сентябрь"},
+    10: {"key": "oct", "short": "Окт", "full": "Октябрь"},
+    11: {"key": "nov", "short": "Ноя", "full": "Ноябрь"},
+    12: {"key": "dec", "short": "Дек", "full": "Декабрь"},
+}
+
+
+def build_months_for_employee(db: Session, emp_id: int) -> List[dict]:
+    """Отдаём месяцы в удобном для фронта формате."""
+    stats = (
+        db.query(EmployeeMonthStat)
+        .filter(EmployeeMonthStat.employee_id == emp_id)
+        .order_by(EmployeeMonthStat.year.asc(), EmployeeMonthStat.month.asc())
+        .all()
+    )
+    result: List[dict] = []
+    for s in stats:
+        meta = MONTH_META.get(s.month, None)
+        if meta:
+            key = s.month_key or meta["key"]
+            short = meta["short"]
+            full = meta["full"]
+        else:
+            key = s.month_key or str(s.month)
+            short = key
+            full = key
+        result.append(
+            {
+                "key": key,
+                "short": short,
+                "fullName": full,
+                "year": s.year,
+                "month": s.month,  # <-- ЭТО ВАЖНО: номер месяца для фронта
+                "income": s.income,
+                "salary": s.salary,
+                "hours": s.hours,
+                "penalties": json_loads_list(s.penalties_json),
+                "absences": json_loads_list(s.absences_json),
+            }
+        )
+    return result
+
+
+
+def seed_month_stats_for_employee(
+    db: Session,
+    emp: Employee,
+    months_data: List[dict],
+):
+    """Создаём помесячную статистику, если её ещё нет."""
+    if not emp:
+        return
+    exists = (
+        db.query(EmployeeMonthStat)
+        .filter(EmployeeMonthStat.employee_id == emp.id)
+        .count()
+    )
+    if exists:
+        return
+
+    for m in months_data:
+        stat = EmployeeMonthStat(
+            employee_id=emp.id,
+            year=m["year"],
+            month=m["month"],
+            month_key=m["key"],
+            income=m["income"],
+            salary=m.get("salary"),
+            hours=m.get("hours"),
+            penalties_json=json_dumps_list(m.get("penalties", [])),
+            absences_json=json_dumps_list(m.get("absences", [])),
+        )
+        db.add(stat)
+
+
+# ===============================
+#        ИНИЦИАЛИЗАЦИЯ БД
+# ===============================
+
 def init_db():
     """Создаём таблицы и демо-данные."""
     Base.metadata.create_all(bind=engine)
     db = SessionLocal()
     try:
-        # пробуем добавить колонку password_plain, если её ещё нет
+        # добавляем колонку password_plain, если её нет
         try:
             db.execute(text("ALTER TABLE employees ADD COLUMN password_plain VARCHAR(255);"))
             db.commit()
         except Exception:
             db.rollback()
-            # колонка уже есть или БД только что создана — игнорируем
+
+        # --- добавляем новые колонки, если их ещё нет ---
+        for ddl in [
+            "ALTER TABLE employees ADD COLUMN balance_int INTEGER;",
+            "ALTER TABLE employees ADD COLUMN contract_hours_per_month INTEGER;",
+            "ALTER TABLE employees ADD COLUMN hourly_rate INTEGER;",
+            "ALTER TABLE employees ADD COLUMN schedule_type VARCHAR(50);",
+            "ALTER TABLE employees ADD COLUMN work_start_hour INTEGER;",
+            "ALTER TABLE employees ADD COLUMN work_end_hour INTEGER;",
+            "ALTER TABLE employees ADD COLUMN last_balance_update DATETIME;",
+        ]:
+            try:
+                db.execute(text(ddl))
+                db.commit()
+            except Exception:
+                db.rollback()
 
         # демо-сотрудник ivan
         if not db.query(Employee).filter_by(login="ivan").first():
@@ -275,18 +477,29 @@ def init_db():
                 salary="92 430 ₽",
                 hours="152 ч",
                 hours_detail="Переработка: 18 ч · Ночные: 12 ч.",
-                penalties_json=json_dumps_list([
-                    "Штрафов: 1 — превышение времени стоянки",
-                    "Прогулы: нет",
-                    "Замечания: отсутствуют",
-                ]),
-                absences_json=json_dumps_list([
-                    "Больничные: 3 дня (ОРВИ)",
-                    "Отпуск: 14/28 дней",
-                    "Отсутствия: 1 день за свой счёт",
-                ]),
+                penalties_json=json_dumps_list(
+                    [
+                        "Штрафов: 1 — превышение времени стоянки",
+                        "Прогулы: нет",
+                        "Замечания: отсутствуют",
+                    ]
+                ),
+                absences_json=json_dumps_list(
+                    [
+                        "Больничные: 3 дня (ОРВИ)",
+                        "Отпуск: 14/28 дней",
+                        "Отсутствия: 1 день за свой счёт",
+                    ]
+                ),
                 error_text="",
                 photo_url=None,
+                balance_int=92430,
+                contract_hours_per_month=152,
+                hourly_rate=608,          # 92 430 / 152 ≈ 608 ₽/ч
+                schedule_type=None,       # водителю пока не начисляем автоматически
+                work_start_hour=None,
+                work_end_hour=None,
+                last_balance_update=datetime.utcnow(),
             )
             db.add(emp)
 
@@ -305,18 +518,29 @@ def init_db():
                 salary="74 300 ₽",
                 hours="128 ч",
                 hours_detail="Переработка: 6 ч · Ночные: 4 ч.",
-                penalties_json=json_dumps_list([
-                    "Штрафов: нет",
-                    "Прогулы: нет",
-                    "Замечания: 1 — опоздание на планёрку",
-                ]),
-                absences_json=json_dumps_list([
-                    "Больничные: не было",
-                    "Отпуск: 7/28 дней",
-                    "Отсутствия: нет",
-                ]),
+                penalties_json=json_dumps_list(
+                    [
+                        "Штрафов: нет",
+                        "Прогулы: нет",
+                        "Замечания: 1 — опоздание на планёрку",
+                    ]
+                ),
+                absences_json=json_dumps_list(
+                    [
+                        "Больничные: не было",
+                        "Отпуск: 7/28 дней",
+                        "Отсутствия: нет",
+                    ]
+                ),
                 error_text="",
                 photo_url=None,
+                balance_int=74300,
+                contract_hours_per_month=128,
+                hourly_rate=580,          # 74 300 / 128 ≈ 580 ₽/ч
+                schedule_type="office",   # будни 8–19
+                work_start_hour=8,
+                work_end_hour=19,
+                last_balance_update=datetime.utcnow(),
             )
             db.add(emp)
 
@@ -328,6 +552,149 @@ def init_db():
                 name="Администратор системы",
             )
             db.add(admin)
+
+        # на всякий случай — чтобы были id у только что добавленных сотрудников
+        db.flush()
+
+        # помесячные данные по ivan
+        ivan = db.query(Employee).filter_by(login="ivan").first()
+        if ivan:
+            seed_month_stats_for_employee(
+                db,
+                ivan,
+                [
+                    {
+                        "year": 2024,
+                        "month": 6,
+                        "key": "jun",
+                        "income": 87762,
+                        "salary": 87762,
+                        "hours": 140,
+                        "penalties": ["Штрафов: нет", "Прогулы: нет"],
+                        "absences": ["Больничные: 1 день", "Отпуск: 5/28 дней"],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 7,
+                        "key": "jul",
+                        "income": 90789,
+                        "salary": 90789,
+                        "hours": 144,
+                        "penalties": ["Штрафов: 1 — превышение времени стоянки"],
+                        "absences": ["Больничные: нет", "Отпуск: 9/28 дней"],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 8,
+                        "key": "aug",
+                        "income": 89562,
+                        "salary": 89562,
+                        "hours": 146,
+                        "penalties": ["Штрафов: нет"],
+                        "absences": ["Больничные: нет", "Отпуск: 14/28 дней"],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 9,
+                        "key": "sep",
+                        "income": 90349,
+                        "salary": 90349,
+                        "hours": 148,
+                        "penalties": ["Штрафов: нет"],
+                        "absences": ["Отсутствия: 1 день за свой счёт"],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 10,
+                        "key": "oct",
+                        "income": 89967,
+                        "salary": 92430,
+                        "hours": 152,
+                        "penalties": ["Штрафов: 1 — превышение времени стоянки"],
+                        "absences": ["Больничные: 3 дня (ОРВИ)", "Отпуск: 14/28 дней"],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 11,
+                        "key": "nov",
+                        "income": 96836,
+                        "salary": 102430,
+                        "hours": 156,
+                        "penalties": ["Штрафов: нет"],
+                        "absences": ["Больничные: нет", "Отпуск: 18/28 дней"],
+                    },
+                ],
+            )
+
+        # помесячные данные по anna
+        anna = db.query(Employee).filter_by(login="anna").first()
+        if anna:
+            seed_month_stats_for_employee(
+                db,
+                anna,
+                [
+                    {
+                        "year": 2024,
+                        "month": 6,
+                        "key": "jun",
+                        "income": 60310,
+                        "salary": 60310,
+                        "hours": 116,
+                        "penalties": [],
+                        "absences": ["Больничные: нет"],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 7,
+                        "key": "jul",
+                        "income": 62140,
+                        "salary": 62140,
+                        "hours": 120,
+                        "penalties": [],
+                        "absences": ["Отпуск: 3/28 дней"],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 8,
+                        "key": "aug",
+                        "income": 64300,
+                        "salary": 64300,
+                        "hours": 124,
+                        "penalties": [],
+                        "absences": ["Отпуск: 7/28 дней"],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 9,
+                        "key": "sep",
+                        "income": 70100,
+                        "salary": 70100,
+                        "hours": 128,
+                        "penalties": ["Замечания: 1 — опоздание на планёрку"],
+                        "absences": [],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 10,
+                        "key": "oct",
+                        "income": 71500,
+                        "salary": 71500,
+                        "hours": 130,
+                        "penalties": [],
+                        "absences": [],
+                    },
+                    {
+                        "year": 2024,
+                        "month": 11,
+                        "key": "nov",
+                        "income": 76800,
+                        "salary": 76800,
+                        "hours": 132,
+                        "penalties": [],
+                        "absences": ["Отпуск: 10/28 дней"],
+                    },
+                ],
+            )
 
         db.commit()
     finally:
@@ -343,11 +710,6 @@ def require_admin(
     admin_login: str = Header(..., alias="X-Admin-Login"),
     admin_password: str = Header(..., alias="X-Admin-Password"),
 ) -> Admin:
-    """
-    Примитивная авторизация админа:
-    любой admin-эндпоинт требует два заголовка:
-    X-Admin-Login и X-Admin-Password.
-    """
     adm = db.query(Admin).filter(Admin.login == admin_login.lower()).first()
     if not adm or not verify_password(admin_password, adm.password_hash):
         raise HTTPException(status_code=401, detail="Админ не авторизован")
@@ -358,14 +720,13 @@ def require_admin(
 #           FASTAPI APP
 # ===============================
 
-app = FastAPI(title="LuchWallet API", version="2.0.0")
+app = FastAPI(title="LuchWallet API", version="2.2.0")
 
-# статика для фото сотрудников
 app.mount("/static", StaticFiles(directory=PHOTOS_DIR), name="static")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # потом можно ограничить доменом фронта
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -395,7 +756,16 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
         if not emp or not verify_password(password, emp.password_hash):
             raise HTTPException(status_code=401, detail="Неверный логин или пароль")
 
+        # авто-начисление баланса
+        accrue_balance_for_employee(emp)
+        db.commit()
+        db.refresh(emp)
+
+        # помесячные данные для графика
+        months = build_months_for_employee(db, emp.id)
+
         data = {
+            "id": emp.id,
             "initials": emp.initials,
             "name": emp.name,
             "position": emp.position,
@@ -409,6 +779,7 @@ def login(payload: LoginRequest, db: Session = Depends(get_db)):
             "absences": json_loads_list(emp.absences_json),
             "errorText": emp.error_text or "",
             "photo_url": emp.photo_url,
+            "months": months,
         }
         return LoginResponse(role="employee", login=login_value, data=data)
 
@@ -446,6 +817,10 @@ def get_employee(
     emp = db.query(Employee).filter(Employee.id == emp_id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Сотрудник не найден")
+
+    accrue_balance_for_employee(emp)
+    db.commit()
+    db.refresh(emp)
 
     return EmployeeDetail(
         id=emp.id,
@@ -497,6 +872,13 @@ def create_employee(
         error_text=payload.error_text or "",
         photo_url=payload.photo_url,
         is_active=True,
+        balance_int=money_to_int(payload.salary or "0"),
+        contract_hours_per_month=None,
+        hourly_rate=None,
+        schedule_type=None,
+        work_start_hour=None,
+        work_end_hour=None,
+        last_balance_update=datetime.utcnow(),
     )
     db.add(emp)
     db.commit()
@@ -520,7 +902,6 @@ def update_employee(
 
     data = payload.dict(exclude_unset=True)
 
-    # изменение логина
     new_login = data.pop("login", None)
     if new_login:
         new_login = new_login.lower()
@@ -528,13 +909,11 @@ def update_employee(
             raise HTTPException(status_code=400, detail="Новый логин уже занят")
         emp.login = new_login
 
-    # изменение пароля
     new_password = data.pop("password", None)
     if new_password:
         emp.password_hash = get_password_hash(new_password)
         emp.password_plain = new_password
 
-    # остальные поля
     if "initials" in data:
         emp.initials = data["initials"]
     if "name" in data:
@@ -549,6 +928,7 @@ def update_employee(
         emp.status = data["status"]
     if "salary" in data:
         emp.salary = data["salary"]
+        emp.balance_int = money_to_int(emp.salary)
     if "hours" in data:
         emp.hours = data["hours"]
     if "hours_detail" in data:
@@ -612,6 +992,61 @@ def upload_employee_photo(
     return {"status": "ok", "photo_url": emp.photo_url}
 
 
+# ---------- АДМИН: ЭКСПОРТ КАРТОЧКИ В EXCEL ----------
+
+@app.get("/api/employees/{emp_id}/export")
+def export_employee_excel(
+    emp_id: int,
+    db: Session = Depends(get_db),
+    admin: Admin = Depends(require_admin),
+):
+    emp = db.query(Employee).filter(Employee.id == emp_id).first()
+    if not emp:
+        raise HTTPException(status_code=404, detail="Сотрудник не найден")
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Карточка сотрудника"
+
+    ws.append(["Поле", "Значение"])
+    ws.append(["ID", emp.id])
+    ws.append(["Логин", emp.login])
+    ws.append(["ФИО", emp.name])
+    ws.append(["Инициалы", emp.initials])
+    ws.append(["Должность", emp.position])
+    ws.append(["Оклад", emp.rate or ""])
+    ws.append(["Стаж", emp.experience or ""])
+    ws.append(["Статус", emp.status or ""])
+    ws.append(["Баланс", emp.salary or ""])
+    ws.append(["Отработанное время", emp.hours or ""])
+    ws.append(["Детализация времени", emp.hours_detail or ""])
+    ws.append(["Примечание / ошибка", emp.error_text or ""])
+
+    penalties = " ; ".join(json_loads_list(emp.penalties_json))
+    absences = " ; ".join(json_loads_list(emp.absences_json))
+
+    ws.append(["Штрафы и дисциплина", penalties])
+    ws.append(["Больничные и отсутствия", absences])
+
+    if emp.photo_url:
+        ws.append(["Фото (URL)", emp.photo_url])
+
+    stream = io.BytesIO()
+    wb.save(stream)
+    stream.seek(0)
+
+    filename = f"employee_{emp_id}_card.xlsx"
+    headers = {
+        "Content-Disposition": f'attachment; filename="{filename}"'
+    }
+
+    return StreamingResponse(
+        stream,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers=headers,
+    )
+
+
 # ---------- АДМИН: ПЛАТЕЖИ (КОШЕЛЁК) ----------
 
 @app.get("/api/employees/{emp_id}/payments", response_model=List[PaymentOut])
@@ -620,7 +1055,6 @@ def list_payments_for_employee(
     db: Session = Depends(get_db),
     admin: Admin = Depends(require_admin),
 ):
-    # проверяем, что сотрудник существует
     emp = db.query(Employee).filter(Employee.id == emp_id).first()
     if not emp:
         raise HTTPException(status_code=404, detail="Сотрудник не найден")
