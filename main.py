@@ -260,6 +260,15 @@ class PaymentOut(PaymentBaseSchema):
         orm_mode = True
 
 
+class EmployeeSelfPaymentsRequest(BaseModel):
+    """
+    Для /api/employee/payments — запрос с логином и паролем сотрудника.
+    (без поля role, как и шлёт фронт)
+    """
+    login: str
+    password: str
+
+
 # ===============================
 #        ВСПОМОГАТЕЛЬНОЕ
 # ===============================
@@ -304,6 +313,16 @@ def is_office_work_time(dt: datetime, start_hour: int, end_hour: int) -> bool:
     return h >= start_hour or h < end_hour
 
 
+def ensure_emp_balance_initialized(emp: Employee):
+    """
+    Гарантируем, что balance_int и salary синхронизированы.
+    """
+    if emp.balance_int is None:
+        emp.balance_int = money_to_int(emp.salary or "0")
+    if emp.salary is None:
+        emp.salary = int_to_money(emp.balance_int or 0)
+
+
 def accrue_balance_for_employee(emp: Employee, now: Optional[datetime] = None):
     """
     Обновляет баланс сотрудника в БД по почасовой ставке.
@@ -323,8 +342,7 @@ def accrue_balance_for_employee(emp: Employee, now: Optional[datetime] = None):
     # инициализация
     if not emp.last_balance_update:
         emp.last_balance_update = now
-        if emp.balance_int is None:
-            emp.balance_int = money_to_int(emp.salary or "0")
+        ensure_emp_balance_initialized(emp)
         return
 
     cursor = emp.last_balance_update.replace(minute=0, second=0, microsecond=0)
@@ -338,10 +356,9 @@ def accrue_balance_for_employee(emp: Employee, now: Optional[datetime] = None):
         cursor += timedelta(hours=1)
 
     if hours_to_pay > 0:
-        current_balance = emp.balance_int or money_to_int(emp.salary or "0")
-        current_balance += hours_to_pay * emp.hourly_rate
-        emp.balance_int = current_balance
-        emp.salary = int_to_money(current_balance)
+        ensure_emp_balance_initialized(emp)
+        emp.balance_int += hours_to_pay * emp.hourly_rate
+        emp.salary = int_to_money(emp.balance_int)
 
     emp.last_balance_update = cursor
 
@@ -387,7 +404,7 @@ def build_months_for_employee(db: Session, emp_id: int) -> List[dict]:
                 "short": short,
                 "fullName": full,
                 "year": s.year,
-                "month": s.month,  # <-- ЭТО ВАЖНО: номер месяца для фронта
+                "month": s.month,  # <-- ВАЖНО: номер месяца для фронта
                 "income": s.income,
                 "salary": s.salary,
                 "hours": s.hours,
@@ -396,7 +413,6 @@ def build_months_for_employee(db: Session, emp_id: int) -> List[dict]:
             }
         )
     return result
-
 
 
 def seed_month_stats_for_employee(
@@ -428,6 +444,64 @@ def seed_month_stats_for_employee(
             absences_json=json_dumps_list(m.get("absences", [])),
         )
         db.add(stat)
+
+
+def update_month_stat_on_payment(
+    db: Session,
+    emp_id: int,
+    amount_diff: int,
+    created_at: datetime,
+    payment_type: str,
+    comment: Optional[str] = None,
+    reverse: bool = False,
+):
+    """
+    Обновляет EmployeeMonthStat при добавлении/удалении платежа.
+    amount_diff — сумма платежа (для удаления можно использовать ту же сумму, но reverse=True).
+    reverse=True — "откатить" операцию (income -= amount_diff вместо +=).
+    """
+    year = created_at.year
+    month = created_at.month
+
+    stat = (
+        db.query(EmployeeMonthStat)
+        .filter(
+            EmployeeMonthStat.employee_id == emp_id,
+            EmployeeMonthStat.year == year,
+            EmployeeMonthStat.month == month,
+        )
+        .first()
+    )
+
+    if not stat:
+        # если удаляем операцию, а стата нет — ничего не делаем
+        if reverse:
+            return
+        meta = MONTH_META.get(month, {"key": str(month)})
+        stat = EmployeeMonthStat(
+            employee_id=emp_id,
+            year=year,
+            month=month,
+            month_key=meta["key"],
+            income=0,
+            salary=0,
+            hours=None,
+            penalties_json=json_dumps_list([]),
+            absences_json=json_dumps_list([]),
+        )
+        db.add(stat)
+        db.flush()
+
+    sign = -1 if reverse else 1
+    delta = sign * amount_diff
+
+    stat.income = (stat.income or 0) + delta
+
+    # немного логики для salary: учитываем только тип "salary" как "зарплату"
+    if payment_type == "salary":
+        stat.salary = (stat.salary or 0) + delta
+
+    # можно при желании расширить логику для штрафов/замечаний, пока не трогаем penalties_json
 
 
 # ===============================
@@ -720,7 +794,7 @@ def require_admin(
 #           FASTAPI APP
 # ===============================
 
-app = FastAPI(title="LuchWallet API", version="2.2.0")
+app = FastAPI(title="LuchWallet API", version="2.3.0")
 
 app.mount("/static", StaticFiles(directory=PHOTOS_DIR), name="static")
 
@@ -1086,6 +1160,25 @@ def create_payment_for_employee(
         comment=payload.comment,
     )
     db.add(payment)
+
+    # обновляем баланс сотрудника
+    ensure_emp_balance_initialized(emp)
+    emp.balance_int += payload.amount
+    emp.salary = int_to_money(emp.balance_int)
+
+    db.flush()  # чтобы у payment был created_at
+
+    # обновляем помесячную статистику
+    update_month_stat_on_payment(
+        db=db,
+        emp_id=emp_id,
+        amount_diff=payload.amount,
+        created_at=payment.created_at,
+        payment_type=payload.type,
+        comment=payload.comment,
+        reverse=False,
+    )
+
     db.commit()
     db.refresh(payment)
 
@@ -1102,6 +1195,53 @@ def delete_payment(
     if not payment:
         raise HTTPException(status_code=404, detail="Платёж не найден")
 
+    emp = db.query(Employee).filter(Employee.id == payment.employee_id).first()
+    if emp:
+        # откатываем баланс
+        ensure_emp_balance_initialized(emp)
+        emp.balance_int -= payment.amount
+        emp.salary = int_to_money(emp.balance_int)
+
+        # откатываем помесячную статистику
+        update_month_stat_on_payment(
+            db=db,
+            emp_id=emp.id,
+            amount_diff=payment.amount,
+            created_at=payment.created_at,
+            payment_type=payment.type,
+            comment=payment.comment,
+            reverse=True,
+        )
+
     db.delete(payment)
     db.commit()
     return {"status": "deleted", "id": payment_id}
+
+
+# ---------- СОТРУДНИК: СВОЯ ИСТОРИЯ ОПЕРАЦИЙ (баланс) ----------
+
+@app.post("/api/employee/payments", response_model=List[PaymentOut])
+def list_payments_for_employee_self(
+    payload: EmployeeSelfPaymentsRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Эндпоинт для фронта при клике на баланс (модалка истории).
+    На вход: login + password сотрудника.
+    """
+    login_value = payload.login.strip().lower()
+    emp = db.query(Employee).filter(Employee.login == login_value).first()
+    if not emp or not verify_password(payload.password, emp.password_hash):
+        raise HTTPException(status_code=401, detail="Неверный логин или пароль")
+
+    # при желании можно перед выдачей ещё раз обновить баланс
+    accrue_balance_for_employee(emp)
+    db.commit()
+
+    payments = (
+        db.query(Payment)
+        .filter(Payment.employee_id == emp.id)
+        .order_by(Payment.created_at.desc(), Payment.id.desc())
+        .all()
+    )
+    return payments
